@@ -1,0 +1,406 @@
+---
+title: "Synthetic Data Generation and Evaluation for WP13 AT"
+author: "WP13 AT"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+execute:
+  eval: false
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+# Overview
+
+This document demonstrates a compact workflow for generating synthetic versions of the `eusilcP` population data and comparing the resulting data sets with basic disclosure-risk and utility-oriented measures.
+
+The workflow has four main parts:
+
+1.  Install and load the required R and Python dependencies.
+2.  Prepare the `eusilcP` population data.
+3.  Generate synthetic data with `simPop`, `synthpop`, and a tabular ARGAN workflow.
+4.  Evaluate the synthetic data with replicated uniques and RAPID.
+
+The code chunks are shown but not evaluated by default. This avoids accidental package installation, Python environment changes, and long model-fitting steps when rendering the document. To run the full workflow, change `eval: false` to `eval: true` in the YAML header or run the chunks interactively.
+
+# Environment Setup
+
+The workflow depends on several R packages, one GitHub package, and a Python package used through `reticulate`. The installation steps are separated from the analysis so they can be run once per machine.
+
+```{r}
+#| label: install-r-packages
+
+install.packages(c(
+  "data.table",
+  "simPop",
+  "synthpop",
+  "devtools",
+  "reticulate",
+  "keras"
+))
+
+devtools::install_github("qwertzlbry/RAPID")
+keras::install_keras()
+```
+
+The tabular ARGAN part of the workflow uses the Python package `mostlyai`. The command below installs the package into the Keras virtual environment.
+
+```{r}
+#| label: install-python-packages
+
+system("~/.virtualenvs/r-keras/bin/pip install -U 'mostlyai[local]'")
+```
+
+After installation, point `reticulate` to the same Python executable. In a fresh R session, this should be set before loading packages that initialize Python.
+
+```{r}
+#| label: configure-reticulate
+
+Sys.setenv(RETICULATE_PYTHON = "~/.virtualenvs/r-keras/bin/python")
+```
+
+Load the R packages used throughout the example.
+
+```{r}
+#| label: load-packages
+
+library(data.table)
+library(simPop)
+library(synthpop)
+library(devtools)
+library(RAPID)
+```
+
+# Data Preparation
+
+The example uses the `eusilcP` population data from `simPop`. We convert it to a `data.table` and derive two total income variables:
+
+- `IncomeP`: total personal income, calculated from variables starting with `py`
+- `IncomeH`: total household income, calculated from variables starting with `hy`
+
+```{r}
+#| label: load-and-prepare-data
+
+data(eusilcP)
+setDT(eusilcP)
+
+cnames <- colnames(eusilcP)
+income_h <- cnames[cnames %like% "^hy"]
+
+eusilcP[, IncomeP := rowSums(.SD), .SDcols = patterns("^py")]
+eusilcP[, IncomeH := rowSums(.SD[1,]), by = .(hid), .SDcols = patterns("^hy")]
+```
+
+# Synthetic Data Generation
+
+This section applies three different synthetic data generation approaches:
+
+- `simPop`, using household structure and sequential variable simulation
+- `synthpop`, using sequential synthesis over selected variables
+- tabular ARGAN, using a Python-based generation workflow through `reticulate`
+
+## simPop
+
+The `simPop` workflow starts by declaring the household identifier, household size, strata, and population status. It then simulates household structure, categorical variables, and continuous income variables.
+
+```{r}
+#| label: generate-simpop
+
+inp <- specifyInput(
+  data = eusilcP,
+  hhid = "hid",
+  hhsize = "hsize",
+  strata = "region",
+  population = TRUE
+)
+
+simPop_data <- simStructure(
+  data = inp,
+  method = "direct",
+  basicHHvars = c("age", "gender")
+)
+
+simPop_data <- simCategorical(
+  simPop_data,
+  additional = c("citizenship"),
+  method = "ranger",
+  nr_cpus = 1
+)
+
+simPop_data <- simCategorical(
+  simPop_data,
+  additional = c("ecoStat"),
+  method = "ranger",
+  nr_cpus = 1
+)
+
+simPop_data <- simContinuous(
+  simPop_data,
+  additional = c("IncomeP"),
+  method = "multinom",
+  nr_cpus = 1
+)
+
+simPop_data <- simContinuous(
+  simPop_data,
+  additional = c("IncomeH"),
+  method = "multinom",
+  nr_cpus = 1
+)
+
+simPop_data@pop@data
+simPop_data <- copy(simPop_data@pop@data)
+```
+
+## synthpop
+
+For `synthpop`, we define a compact set of variables and use them as the visit sequence. The resulting synthetic data is converted to a `data.table` for later evaluation.
+
+```{r}
+#| label: generate-synthpop
+
+synth_vars <- c(
+  "age",
+  "gender",
+  "region",
+  "citizenship",
+  "ecoStat",
+  "IncomeP",
+  "IncomeH"
+)
+
+synthpop_data <- synthpop::syn(
+  subset(eusilcP, select = synth_vars),
+  visit.sequence = synth_vars
+)
+
+synthpop_data$syn
+synthpop_data <- synthpop_data$syn
+setDT(synthpop_data)
+```
+
+## Tabular ARGAN
+
+The tabular ARGAN workflow splits the population into a household file and a person file, writes both to CSV, runs the Python generation script, and merges the generated household and person files back into one synthetic data set.
+
+```{r}
+#| label: generate-tabular-argan
+
+eusilcP_house <- eusilcP[!duplicated(hid), .(hid, hsize, region)]
+eusilcP_pers <- eusilcP[, .(hid, age, gender, citizenship, IncomeP, IncomeH)]
+
+fwrite(eusilcP_house, file = "eusilcP_house.csv")
+fwrite(eusilcP_pers, file = "eusilcP_pers.csv")
+
+reticulate::source_python("TabularARGN.py")
+
+tabularARGN_house <- fread("eusilcP_house_TabularARGAN.csv")
+tabularARGN_house[, V1 := NULL]
+
+tabularARGN_pers <- fread("eusilcP_pers_TabularARGAN.csv")
+tabularARGN_pers[, V1 := NULL]
+
+tabularARGAN_data <- merge(tabularARGN_house, tabularARGN_pers, by = "hid")
+```
+
+# Risk and Utility Evaluation
+
+The following sections compute two forms of evaluation output:
+
+- the share of replicated unique records for selected key variables
+- RAPID disclosure-risk results for selected prediction models and error metrics
+
+## Replicated Uniques
+
+Replicated uniques are records that are unique in both the original and synthetic data for the selected key variables. A higher share indicates more one-to-one uniqueness reproduction and therefore a higher disclosure-risk signal.
+
+```{r}
+#| label: replicated-uniques-function
+
+repl_uniques <- function(data_synth, data_orig, key_vars) {
+  uniques_orig <- data_orig[, .(N_orig = .N), by = c(key_vars)]
+  uniques_synth <- data_synth[, .(N_synth = .N), by = c(key_vars)]
+
+  uniques_dt <- merge(uniques_orig, uniques_synth, by = c(key_vars), all = TRUE)
+  uniques_dt[is.na(N_orig), N_orig := 0]
+  uniques_dt[is.na(N_synth), N_synth := 0]
+  uniques_dt[, rep_uniques := N_orig == 1 & N_synth == 1]
+
+  uniques_dt
+}
+```
+
+The same key variables are applied to all three synthetic data sets.
+
+```{r}
+#| label: replicated-uniques-analysis
+
+key_vars <- c("age", "gender", "region", "IncomeP")
+
+rep_u_simPop <- repl_uniques(
+  data_synth = simPop_data,
+  data_orig = eusilcP,
+  key_vars = key_vars
+)
+rep_u_simPop[, sum(N_synth[rep_uniques]) / sum(N_synth)]
+
+rep_u_synthpop <- repl_uniques(
+  data_synth = synthpop_data,
+  data_orig = eusilcP,
+  key_vars = key_vars
+)
+rep_u_synthpop[, sum(N_synth[rep_uniques]) / sum(N_synth)]
+
+rep_u_tabularARGAN <- repl_uniques(
+  data_synth = tabularARGAN_data,
+  data_orig = eusilcP,
+  key_vars = key_vars
+)
+rep_u_tabularARGAN[, sum(N_synth[rep_uniques]) / sum(N_synth)]
+
+res <- data.table(
+  Method = c("simPop", "synthPop", "tabularARGAN"),
+  repl.U = c(
+    rep_u_simPop[, sum(N_synth[rep_uniques]) / sum(N_synth)],
+    rep_u_synthpop[, sum(N_synth[rep_uniques]) / sum(N_synth)],
+    rep_u_tabularARGAN[, sum(N_synth[rep_uniques]) / sum(N_synth)]
+  )
+)
+
+print(res)
+```
+
+## RAPID Risk Assessment
+
+RAPID is used to estimate record-level risk for predicting `IncomeP` from synthetic data. Two model specifications are compared:
+
+- an intercept-only model
+- a model using `gender`, `age`, and `region`
+
+The analysis is restricted to records older than 14 years when modelling income.
+
+```{r}
+#| label: rapid-inputs
+
+eusilcP[, Intercept := 1]
+simPop_data[, Intercept := 1]
+synthpop_data[, Intercept := 1]
+tabularARGAN_data[, Intercept := 1]
+
+vars_model <- list(
+  c("Intercept"),
+  c("gender", "age", "region")
+)
+
+v <- c("IncomeP")
+filter_age <- 14
+
+num_eps <- c(0.05, 500)
+error_metric <- c("symmetric", "absolute")
+
+output_results <- list()
+```
+
+The loop below runs RAPID for every combination of model specification and error metric, then stores one comparable result table for each synthesis method.
+
+```{r}
+#| label: rapid-loop
+
+for (m in vars_model) {
+  for (i in seq_along(num_eps)) {
+    result_simPop <- rapid(
+      original_data = eusilcP[age > filter_age],
+      synthetic_data = simPop_data[age > filter_age],
+      quasi_identifiers = m,
+      sensitive_attribute = v,
+      model_type = "rf",
+      num_epsilon = num_eps[i],
+      num_error_metric = error_metric[i],
+      return_all_records = TRUE
+    )
+
+    dt_simPop <- as.data.table(result_simPop$risk$rows_risk_df)
+    dt_simPop[, ID := .I]
+    dt_simPop <- dt_simPop[, .(ID, at_risk)]
+    dt_simPop[, Model := paste(m, collapse = " + ")]
+    dt_simPop[, Sens_var := v]
+    dt_simPop[, Error_metric := error_metric[i]]
+    dt_simPop[, Method := "simPop"]
+
+    result_synthpop <- rapid(
+      original_data = eusilcP[age > filter_age],
+      synthetic_data = synthpop_data[age > filter_age],
+      quasi_identifiers = m,
+      sensitive_attribute = v,
+      model_type = "rf",
+      num_epsilon = num_eps[i],
+      num_error_metric = error_metric[i],
+      return_all_records = TRUE
+    )
+
+    dt_synthpop <- as.data.table(result_synthpop$risk$rows_risk_df)
+    dt_synthpop[, ID := .I]
+    dt_synthpop <- dt_synthpop[, .(ID, at_risk)]
+    dt_synthpop[, Model := paste(m, collapse = " + ")]
+    dt_synthpop[, Sens_var := v]
+    dt_synthpop[, Error_metric := error_metric[i]]
+    dt_synthpop[, Method := "synthpop"]
+
+    result_tabularARGAN <- rapid(
+      original_data = eusilcP[age > filter_age],
+      synthetic_data = tabularARGAN_data[age > filter_age],
+      quasi_identifiers = m,
+      sensitive_attribute = v,
+      model_type = "rf",
+      num_epsilon = num_eps[i],
+      num_error_metric = error_metric[i],
+      return_all_records = TRUE
+    )
+
+    dt_tabularARGAN <- as.data.table(result_tabularARGAN$risk$rows_risk_df)
+    dt_tabularARGAN[, ID := .I]
+    dt_tabularARGAN <- dt_tabularARGAN[, .(ID, at_risk)]
+    dt_tabularARGAN[, Model := paste(m, collapse = " + ")]
+    dt_tabularARGAN[, Sens_var := v]
+    dt_tabularARGAN[, Error_metric := error_metric[i]]
+    dt_tabularARGAN[, Method := "tabularARGAN"]
+
+    output_results <- c(
+      output_results,
+      list(dt_simPop, dt_synthpop, dt_tabularARGAN)
+    )
+  }
+}
+
+output_results <- rbindlist(output_results)
+```
+
+Finally, the record-level RAPID output is aggregated to compare the mean risk indicator across method, model, and error metric.
+
+```{r}
+#| label: rapid-summary
+
+out_rapid <- output_results[
+  ,
+  .(mean(at_risk)),
+  by = .(Method, Model, Error_metric)
+]
+
+print(out_rapid)
+```
+
+# Suggested Outputs
+
+The main objects produced by this workflow are:
+
+- `simPop_data`: synthetic data from `simPop`
+- `synthpop_data`: synthetic data from `synthpop`
+- `tabularARGAN_data`: synthetic data from the tabular ARGAN workflow
+- `res`: replicated-unique shares by synthesis method
+- `out_rapid`: aggregated RAPID risk estimates
